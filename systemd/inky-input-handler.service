@@ -1,0 +1,18 @@
+[Unit]
+Description=Einky input handler (GPIO buttons -> Ren'Py keypresses)
+After=multi-user.target inky-launcher.service
+Requires=inky-launcher.service
+
+[Service]
+Type=simple
+User=einky
+Group=einky
+Environment=DISPLAY=:0
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/usr/bin/python3 -m input
+Restart=on-failure
+RestartSec=2
+SupplementaryGroups=gpio input
+
+[Install]
+WantedBy=multi-user.target

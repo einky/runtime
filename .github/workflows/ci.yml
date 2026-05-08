@@ -1,0 +1,40 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  python:
+    uses: einky/.github/.github/workflow-templates/python.yml@main
+    with:
+      python-version: "3.12"
+      source-paths: "src tests"
+
+  c:
+    uses: einky/.github/.github/workflow-templates/c.yml@main
+    with:
+      source-paths: "src/spi_driver"
+      make-target: "compile-c-only"
+      make-test-target: ""
+
+  install-script-parity:
+    name: install-renpy-sdk.sh parity
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: einky/meta
+          path: meta
+      - uses: actions/checkout@v4
+        with:
+          path: runtime
+      - name: Compare scripts
+        run: |
+          # The runtime copy is normally a symlink to ../../meta/scripts/install-renpy-sdk.sh.
+          # In CI the two repos are checked out side-by-side; verify byte parity.
+          diff -q meta/scripts/install-renpy-sdk.sh runtime/scripts/install-renpy-sdk.sh

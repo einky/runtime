@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+htmlcov/
+
+# C build artifacts
+build/
+*.so
+*.o
+*.a
+*.d
+
+# Editors / tooling
+.claude/
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store

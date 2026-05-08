@@ -1,0 +1,21 @@
+[Unit]
+Description=Einky frame processor (Xvfb capture -> dither -> e-paper)
+After=multi-user.target inky-launcher.service
+Requires=inky-launcher.service
+
+[Service]
+Type=simple
+User=einky
+Group=einky
+Environment=DISPLAY=:0
+Environment=EINKY_BACKEND=spi
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/usr/bin/python3 -m frame_processor
+Restart=on-failure
+RestartSec=2
+# Allow access to /dev/spidev*, /dev/gpiochip*
+SupplementaryGroups=spi gpio video
+Nice=-5
+
+[Install]
+WantedBy=multi-user.target

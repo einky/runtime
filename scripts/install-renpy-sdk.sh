@@ -1,0 +1,1 @@
+../../meta/scripts/install-renpy-sdk.sh
