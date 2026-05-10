@@ -18,9 +18,11 @@ def main() -> int:
     )
     backend = os.environ.get("EINKY_BACKEND", "spi")
     socket_path = os.environ.get("EINKY_SOCKET_PATH", "/tmp/einky-preview.sock")
+    tcp_host = os.environ.get("EINKY_TCP_HOST", "0.0.0.0")
+    tcp_port = int(os.environ.get("EINKY_TCP_PORT", "5333"))
     fps = float(os.environ.get("EINKY_TARGET_FPS", "2.0"))
 
-    sink = make_sink(backend, socket_path)
+    sink = make_sink(backend, socket_path, tcp_host, tcp_port)
     proc = FrameProcessor(capture=XCapture(), sink=sink, target_fps=fps)
     proc.run()
     return 0

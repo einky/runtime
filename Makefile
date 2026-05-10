@@ -1,4 +1,4 @@
-.PHONY: setup build-c compile-c-only lint format test run-dev run-prod clean
+.PHONY: setup build-c compile-c-only lint format test run-dev run-dev-tcp run-input-net run-prod clean
 
 PYTHON ?= python3
 VENV   ?= .venv
@@ -48,6 +48,15 @@ test:
 run-dev:
 	EINKY_BACKEND=socket EINKY_SOCKET_PATH=/tmp/einky-preview.sock \
 	  $(PY) -m frame_processor
+
+# WSL + ESP32 bridge demo path (ADR 0006).
+run-dev-tcp:
+	EINKY_BACKEND=tcp EINKY_TCP_HOST=0.0.0.0 EINKY_TCP_PORT=5333 \
+	  $(PY) -m frame_processor
+
+run-input-net:
+	EINKY_INPUT_BACKEND=net EINKY_INPUT_HOST=0.0.0.0 EINKY_INPUT_PORT=5334 \
+	  $(PY) -m input
 
 run-prod:
 	EINKY_BACKEND=spi $(PY) -m frame_processor

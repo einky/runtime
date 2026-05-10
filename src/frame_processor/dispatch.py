@@ -1,23 +1,27 @@
-"""Frame dispatch: SPI driver in prod, Unix-socket preview in dev.
+"""Frame dispatch: SPI driver in prod, Unix-socket / TCP preview in dev.
 
-Dev-mode socket protocol (length-prefixed, little-endian):
+Dev-mode wire protocol (length-prefixed, little-endian, identical for both
+`socket` and `tcp` backends):
 
     | 4 bytes | 4 bytes | 4 bytes | N bytes |
     | magic   | width   | height  | packed  |
     | 'EINK'  | u32     | u32     | 1-bit   |
 
-`packed` length = height * (width / 8). One frame per send. The receiver
-(typically `tools/preview.py` on a developer workstation) decodes and shows
-the frame in a window.
+`packed` length = height * (width / 8). One frame per send. The Unix-socket
+receiver is `tools/preview.py` on the workstation; the TCP receiver is the
+ESP32 dev bridge (see ADR 0006) which forwards frames to a real e-paper.
 """
 
 from __future__ import annotations
 
+import logging
 import socket
 import struct
 from typing import Protocol
 
 MAGIC = b"EINK"
+
+log = logging.getLogger(__name__)
 
 
 class FrameSink(Protocol):
@@ -73,9 +77,68 @@ class SpiSink:
         self._panel.sleep()
 
 
-def make_sink(backend: str, socket_path: str) -> FrameSink:
+class TcpFrameSink:
+    """Dev-mode sink that streams frames to a TCP client (the ESP32 bridge).
+
+    We bind+listen on `host:port`, accept one client at a time, and re-accept
+    on disconnect. Frames sent while no client is connected are dropped; the
+    ESP32 will pick up at the next produced frame.
+    """
+
+    _ACCEPT_POLL_SECONDS = 0.5
+
+    def __init__(self, host: str, port: int) -> None:
+        self._addr = (host, port)
+        self._server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self._server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self._server.bind(self._addr)
+        self._server.listen(1)
+        self._server.settimeout(self._ACCEPT_POLL_SECONDS)
+        self._client: socket.socket | None = None
+        log.info("TCP frame sink listening on %s:%d", host, port)
+
+    def _ensure_client(self) -> socket.socket | None:
+        if self._client is not None:
+            return self._client
+        try:
+            conn, peer = self._server.accept()
+        except TimeoutError:
+            return None
+        conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        log.info("frame client connected from %s:%d", peer[0], peer[1])
+        self._client = conn
+        return conn
+
+    def send(self, packed: bytes, width: int, height: int) -> None:
+        client = self._ensure_client()
+        if client is None:
+            return
+        header = MAGIC + struct.pack("<II", width, height)
+        try:
+            client.sendall(header + packed)
+        except (BrokenPipeError, ConnectionResetError, TimeoutError, OSError) as e:
+            log.warning("frame client dropped (%s); will re-accept", e)
+            try:
+                client.close()
+            finally:
+                self._client = None
+
+    def close(self) -> None:
+        if self._client is not None:
+            try:
+                self._client.close()
+            finally:
+                self._client = None
+        self._server.close()
+
+
+def make_sink(backend: str, socket_path: str, tcp_host: str, tcp_port: int) -> FrameSink:
     if backend == "socket":
         return SocketSink(socket_path)
+    if backend == "tcp":
+        return TcpFrameSink(tcp_host, tcp_port)
     if backend == "spi":
         return SpiSink()
-    raise ValueError(f"unknown backend: {backend!r} (expected 'spi' or 'socket')")
+    raise ValueError(
+        f"unknown backend: {backend!r} (expected 'spi', 'socket', or 'tcp')"
+    )
