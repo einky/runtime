@@ -38,3 +38,24 @@ jobs:
           # The runtime copy is normally a symlink to ../../meta/scripts/install-renpy-sdk.sh.
           # In CI the two repos are checked out side-by-side; verify byte parity.
           diff -q meta/scripts/install-renpy-sdk.sh runtime/scripts/install-renpy-sdk.sh
+
+  contract-parity:
+    name: hardware contract parity
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: einky/meta
+          path: meta
+      - uses: actions/checkout@v4
+        with:
+          path: runtime
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Check generated files match meta/shared/hardware.toml
+        run: |
+          # meta and runtime are checked out side-by-side, matching the layout
+          # gen_from_contract.py resolves by default (../meta/shared/hardware.toml).
+          # Re-renders every committed constant file and fails on any drift.
+          python runtime/scripts/gen_from_contract.py --check

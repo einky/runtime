@@ -3,7 +3,8 @@
 ESP32 firmware that stands in for a broken Pi during a demo: receive 800×480
 1-bit frames over TCP from the runtime on WSL and forward them to a
 Waveshare 7.5" V2 e-paper, then read 7 buttons and send their names back over
-TCP. **This is a temporary bring-up hack — see `meta/adr/0006-esp32-dev-bridge.md`.**
+TCP. **This is a temporary bring-up hack — see
+[`../../meta/adr/0006-esp32-dev-bridge.md`](../../meta/adr/0006-esp32-dev-bridge.md).**
 
 ## Wiring
 
@@ -19,6 +20,12 @@ TCP. **This is a temporary bring-up hack — see `meta/adr/0006-esp32-dev-bridge
 | A / B / Start            | 27 / 14 / 12 |
 
 Buttons go to GND when pressed; firmware uses `INPUT_PULLUP`.
+
+The button pins, TCP ports, frame magic, and panel geometry above are **not**
+hand-maintained here: they are generated into `include/contract.h` from
+`meta/shared/hardware.toml` by `scripts/gen_from_contract.py` (run `make gen` from
+`runtime/`). Only the WiFi/host secrets and the ESP32's own EPD SPI pins live in
+`include/config.h`. Bump the shared contract, regenerate, and reflash.
 
 ## Build & flash
 

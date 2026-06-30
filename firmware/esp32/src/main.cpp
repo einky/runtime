@@ -13,9 +13,11 @@
 
 #include "config.h"
 
-static constexpr uint16_t PANEL_W = 800;
-static constexpr uint16_t PANEL_H = 480;
-static constexpr size_t FRAME_BYTES = PANEL_W / 8 * PANEL_H; // 48000
+// Panel geometry, ports, magic, and button pins all come from contract.h
+// (pulled in via config.h), generated from meta/shared/hardware.toml.
+static constexpr uint16_t PANEL_W = EINKY_PANEL_W;
+static constexpr uint16_t PANEL_H = EINKY_PANEL_H;
+static constexpr size_t FRAME_BYTES = EINKY_FRAME_BYTES; // 48000
 
 // Paged buffer (HEIGHT/8 ≈ 6 KB) so GxEPD2's internal buffer doesn't collide
 // with our own 48 KB frameBuf in DRAM. firstPage()/nextPage() iterates 8x.
@@ -24,7 +26,7 @@ GxEPD2_BW<GxEPD2_750_T7, GxEPD2_750_T7::HEIGHT / 8>
 
 static uint8_t frameBuf[FRAME_BYTES];
 static uint32_t framesDrawn = 0;
-static constexpr uint32_t FULL_REFRESH_EVERY = 30;
+static constexpr uint32_t FULL_REFRESH_EVERY = EINKY_FULL_REFRESH_EVERY;
 
 struct Button {
     const char *name;
@@ -40,7 +42,7 @@ static Button buttons[] = {
     {"start", BTN_START_PIN, HIGH, 0},
 };
 static constexpr size_t NUM_BUTTONS = sizeof(buttons) / sizeof(buttons[0]);
-static constexpr uint32_t DEBOUNCE_MS = 30; // matches keymap.DEBOUNCE_SECONDS
+static constexpr uint32_t DEBOUNCE_MS = EINKY_DEBOUNCE_MS; // shared debounce_ms
 
 static WiFiClient frameClient;
 static WiFiClient inputClient;
@@ -83,7 +85,7 @@ static bool receiveOneFrame() {
     uint8_t header[12];
     if (!readExact(frameClient, header, sizeof(header), 5000))
         return false;
-    if (memcmp(header, "EINK", 4) != 0) {
+    if (memcmp(header, EINKY_FRAME_MAGIC, 4) != 0) {
         Serial.println("frame: bad magic, dropping connection");
         return false;
     }
