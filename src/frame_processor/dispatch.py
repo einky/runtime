@@ -19,7 +19,7 @@ import socket
 import struct
 from typing import Protocol
 
-MAGIC = b"EINK"
+from frame_processor.constants import MAGIC
 
 log = logging.getLogger(__name__)
 
@@ -139,6 +139,4 @@ def make_sink(backend: str, socket_path: str, tcp_host: str, tcp_port: int) -> F
         return TcpFrameSink(tcp_host, tcp_port)
     if backend == "spi":
         return SpiSink()
-    raise ValueError(
-        f"unknown backend: {backend!r} (expected 'spi', 'socket', or 'tcp')"
-    )
+    raise ValueError(f"unknown backend: {backend!r} (expected 'spi', 'socket', or 'tcp')")

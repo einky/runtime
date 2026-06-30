@@ -1,8 +1,9 @@
 /* GDEM0397T81P SPI driver: minimal init / refresh / sleep API.
  *
  * The panel is a 3.97" 800x480 1-bit e-paper module from GoodDisplay using a
- * UC8253-class controller. Wiring (BCM): MOSI=10, SCLK=11, CS=8, DC=25,
- * RST=17, BUSY=24. Keep these in sync with case/docs/wiring.md.
+ * UC8253-class controller. Panel geometry and the SPI / control pins come from
+ * the shared contract via contract.h (generated from meta/shared/hardware.toml);
+ * do not hard-code them here.
  */
 #ifndef EINKY_SPI_DRIVER_H
 #define EINKY_SPI_DRIVER_H
@@ -10,9 +11,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define EINKY_PANEL_W 800
-#define EINKY_PANEL_H 480
-#define EINKY_FRAME_BYTES ((EINKY_PANEL_W / 8) * EINKY_PANEL_H)
+#include "contract.h"
 
 typedef struct einky_panel einky_panel_t;
 
