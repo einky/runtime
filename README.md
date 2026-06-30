@@ -13,6 +13,19 @@ The launcher renders. The runtime does not know what is on the screen; it
 only knows how to get pixels off Xvfb and onto e-ink, and how to feed buttons
 back the other way.
 
+**`buildroot_os` consumes this repo as a Buildroot package** (ADR 0008): it builds
+the wheel and runs the three console-scripts it exposes —
+
+- `inky-frame` — the Xvfb capture → dither → dispatch pipeline (`frame_processor`),
+- `inky-input` — the GPIO / TCP button reader → keypress injector (`input`),
+- `inky-eink-receiver` — the in-engine path: decode PNGs pushed by Ren'Py's
+  `eink_push_callback` over the engine-capture socket and feed them through the
+  *same* dither/dispatch pipeline (no second dither).
+
+The frame/input/SPI/ESP32 contracts those tools share are owned here and generated
+from `meta/shared/hardware.toml` (see "GPIO pin map"), so the package stays cleanly
+self-describing for downstream consumers.
+
 ## Architecture
 
 ```
@@ -53,8 +66,13 @@ Two systemd units in `systemd/` glue this onto boot. Both depend on
 
 ## GPIO pin map
 
-**Authoritative wiring lives in `case/docs/wiring.md`.** Anything here must
-match. The runtime defines pins in `src/input/keymap.py` and `src/spi_driver/spi_driver.h`.
+**Pins come from the shared hardware contract, `meta/shared/hardware.toml`** (the
+single source of truth; see ADR 0008), and are rendered for humans in
+`docs/hardware/wiring.md`. The runtime does not hand-maintain them: they are
+generated into `src/input/keymap.py`, `src/spi_driver/contract.h`, and
+`src/frame_processor/constants.py` by `scripts/gen_from_contract.py` (`make gen`),
+and the `contract-parity` CI check fails if a committed copy drifts. The table
+below is a convenience copy.
 
 | Function     | BCM pin | Pi header | Notes                       |
 | ------------ | ------- | --------- | --------------------------- |

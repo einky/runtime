@@ -27,11 +27,17 @@ dev = [
 ]
 
 [project.scripts]
-inky-frame-processor = "frame_processor.__main__:main"
-inky-input-handler = "input.__main__:main"
+inky-frame = "frame_processor.__main__:main"
+inky-input = "input.__main__:main"
+inky-eink-receiver = "frame_processor.eink_receiver:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+# Ship the C driver sources + CFFI builder so a consumer (buildroot_os) can compile
+# the _spi_driver extension on-target via `python -m spi_driver.build`.
+[tool.setuptools.package-data]
+spi_driver = ["*.c", "*.h"]
 
 [tool.ruff]
 line-length = 100

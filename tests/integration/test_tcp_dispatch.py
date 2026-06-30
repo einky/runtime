@@ -12,8 +12,8 @@ import struct
 import threading
 import time
 
-from frame_processor.dispatch import MAGIC, TcpFrameSink
-from frame_processor.processor import PANEL_HEIGHT, PANEL_WIDTH
+from frame_processor.constants import MAGIC, PANEL_HEIGHT, PANEL_WIDTH
+from frame_processor.dispatch import TcpFrameSink
 
 
 def _recv_exact(sock: socket.socket, n: int) -> bytes:

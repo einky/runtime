@@ -1,4 +1,4 @@
-.PHONY: setup build-c compile-c-only lint format test run-dev run-dev-tcp run-input-net run-prod clean
+.PHONY: setup build-c compile-c-only lint format test gen gen-check run-dev run-dev-tcp run-input-net run-eink-receiver run-prod clean
 
 PYTHON ?= python3
 VENV   ?= .venv
@@ -45,6 +45,14 @@ format:
 test:
 	$(VENV)/bin/pytest
 
+# Regenerate the committed constants from ../meta/shared/hardware.toml.
+gen:
+	$(PY_RUN) scripts/gen_from_contract.py
+
+# Verify the committed constants match the contract (the contract-parity check).
+gen-check:
+	$(PY_RUN) scripts/gen_from_contract.py --check
+
 run-dev:
 	EINKY_BACKEND=socket EINKY_SOCKET_PATH=/tmp/einky-preview.sock \
 	  $(PY) -m frame_processor
@@ -57,6 +65,12 @@ run-dev-tcp:
 run-input-net:
 	EINKY_INPUT_BACKEND=net EINKY_INPUT_HOST=0.0.0.0 EINKY_INPUT_PORT=5334 \
 	  $(PY) -m input
+
+# In-engine path: receive PNGs on the engine-capture socket and dither them to
+# the dev preview socket (point Ren'Py's eink_push_callback at EINKY_EINK_SOCKET).
+run-eink-receiver:
+	EINKY_BACKEND=socket EINKY_SOCKET_PATH=/tmp/einky-preview.sock \
+	  $(PY) -m frame_processor.eink_receiver
 
 run-prod:
 	EINKY_BACKEND=spi $(PY) -m frame_processor

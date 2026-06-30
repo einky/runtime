@@ -16,8 +16,9 @@ from unittest.mock import MagicMock
 
 import numpy as np
 
-from frame_processor.dispatch import MAGIC, SocketSink
-from frame_processor.processor import PANEL_HEIGHT, PANEL_WIDTH, FrameProcessor
+from frame_processor.constants import MAGIC, PANEL_HEIGHT, PANEL_WIDTH
+from frame_processor.dispatch import SocketSink
+from frame_processor.processor import FrameProcessor
 
 GOLDEN_DIR = Path(__file__).parent.parent / "golden"
 
