@@ -21,6 +21,7 @@
 #define EPD_DC_PIN    17
 #define EPD_RST_PIN   16
 #define EPD_BUSY_PIN   4
+#define EPD_PWR_PIN   13
 // SCK=18, MOSI=23 are the ESP32 default VSPI pins; no #define needed.
 
 // --- Buttons (active-low, INPUT_PULLUP) ---

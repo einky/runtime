@@ -15,35 +15,32 @@
 
 static constexpr uint16_t PANEL_W = 800;
 static constexpr uint16_t PANEL_H = 480;
-static constexpr size_t   FRAME_BYTES = PANEL_W / 8 * PANEL_H;  // 48000
+static constexpr size_t FRAME_BYTES = PANEL_W / 8 * PANEL_H; // 48000
 
-// Full-buffer template — uses ~48 KB of RAM on top of the library's internal
-// state, fits comfortably on the original ESP32 (320 KB SRAM).
-GxEPD2_BW<GxEPD2_750_T7, GxEPD2_750_T7::HEIGHT> display(
-    GxEPD2_750_T7(EPD_CS_PIN, EPD_DC_PIN, EPD_RST_PIN, EPD_BUSY_PIN));
+// Paged buffer (HEIGHT/8 ≈ 6 KB) so GxEPD2's internal buffer doesn't collide
+// with our own 48 KB frameBuf in DRAM. firstPage()/nextPage() iterates 8x.
+GxEPD2_BW<GxEPD2_750_T7, GxEPD2_750_T7::HEIGHT / 8>
+    display(GxEPD2_750_T7(EPD_CS_PIN, EPD_DC_PIN, EPD_RST_PIN, EPD_BUSY_PIN));
 
-static uint8_t  frameBuf[FRAME_BYTES];
+static uint8_t frameBuf[FRAME_BYTES];
 static uint32_t framesDrawn = 0;
 static constexpr uint32_t FULL_REFRESH_EVERY = 30;
 
 struct Button {
-    const char* name;
+    const char *name;
     uint8_t pin;
-    bool lastState;        // INPUT_PULLUP idle is HIGH
+    bool lastState; // INPUT_PULLUP idle is HIGH
     uint32_t lastChangeMs;
 };
 
 static Button buttons[] = {
-    {"up",    BTN_UP_PIN,    HIGH, 0},
-    {"down",  BTN_DOWN_PIN,  HIGH, 0},
-    {"left",  BTN_LEFT_PIN,  HIGH, 0},
-    {"right", BTN_RIGHT_PIN, HIGH, 0},
-    {"a",     BTN_A_PIN,     HIGH, 0},
-    {"b",     BTN_B_PIN,     HIGH, 0},
+    {"up", BTN_UP_PIN, HIGH, 0},       {"down", BTN_DOWN_PIN, HIGH, 0},
+    {"left", BTN_LEFT_PIN, HIGH, 0},   {"right", BTN_RIGHT_PIN, HIGH, 0},
+    {"a", BTN_A_PIN, HIGH, 0},         {"b", BTN_B_PIN, HIGH, 0},
     {"start", BTN_START_PIN, HIGH, 0},
 };
 static constexpr size_t NUM_BUTTONS = sizeof(buttons) / sizeof(buttons[0]);
-static constexpr uint32_t DEBOUNCE_MS = 30;  // matches keymap.DEBOUNCE_SECONDS
+static constexpr uint32_t DEBOUNCE_MS = 30; // matches keymap.DEBOUNCE_SECONDS
 
 static WiFiClient frameClient;
 static WiFiClient inputClient;
@@ -60,36 +57,40 @@ static void connectWiFi() {
 }
 
 // Read exactly `n` bytes from the client into `dst`. Returns false on disconnect.
-static bool readExact(WiFiClient& c, uint8_t* dst, size_t n, uint32_t timeoutMs) {
+static bool readExact(WiFiClient &c, uint8_t *dst, size_t n, uint32_t timeoutMs) {
     size_t got = 0;
     uint32_t deadline = millis() + timeoutMs;
     while (got < n) {
-        if (!c.connected()) return false;
+        if (!c.connected())
+            return false;
         int available = c.available();
         if (available <= 0) {
-            if ((int32_t)(millis() - deadline) > 0) return false;
+            if ((int32_t)(millis() - deadline) > 0)
+                return false;
             delay(1);
             continue;
         }
         int r = c.read(dst + got, n - got);
-        if (r <= 0) return false;
+        if (r <= 0)
+            return false;
         got += r;
-        deadline = millis() + timeoutMs;  // sliding window: any progress resets it
+        deadline = millis() + timeoutMs; // sliding window: any progress resets it
     }
     return true;
 }
 
 static bool receiveOneFrame() {
     uint8_t header[12];
-    if (!readExact(frameClient, header, sizeof(header), 5000)) return false;
+    if (!readExact(frameClient, header, sizeof(header), 5000))
+        return false;
     if (memcmp(header, "EINK", 4) != 0) {
         Serial.println("frame: bad magic, dropping connection");
         return false;
     }
-    uint32_t w = (uint32_t)header[4] | ((uint32_t)header[5] << 8) |
-                 ((uint32_t)header[6] << 16) | ((uint32_t)header[7] << 24);
-    uint32_t h = (uint32_t)header[8] | ((uint32_t)header[9] << 8) |
-                 ((uint32_t)header[10] << 16) | ((uint32_t)header[11] << 24);
+    uint32_t w = (uint32_t)header[4] | ((uint32_t)header[5] << 8) | ((uint32_t)header[6] << 16) |
+                 ((uint32_t)header[7] << 24);
+    uint32_t h = (uint32_t)header[8] | ((uint32_t)header[9] << 8) | ((uint32_t)header[10] << 16) |
+                 ((uint32_t)header[11] << 24);
     if (w != PANEL_W || h != PANEL_H) {
         Serial.printf("frame: bad size %ux%u, expected %ux%u\n", w, h, PANEL_W, PANEL_H);
         return false;
@@ -101,7 +102,8 @@ static void renderFrame() {
     // dither.pack_1bit produces bit=1 for white. drawBitmap with color=BLACK
     // treats bit=1 as foreground, so invert before drawing — bit=0 (black ink)
     // becomes the foreground.
-    for (size_t i = 0; i < FRAME_BYTES; i++) frameBuf[i] = ~frameBuf[i];
+    for (size_t i = 0; i < FRAME_BYTES; i++)
+        frameBuf[i] = ~frameBuf[i];
 
     bool partial = (framesDrawn % FULL_REFRESH_EVERY) != 0;
     display.setFullWindow();
@@ -110,23 +112,27 @@ static void renderFrame() {
         display.fillScreen(GxEPD_WHITE);
         display.drawBitmap(0, 0, frameBuf, PANEL_W, PANEL_H, GxEPD_BLACK);
     } while (display.nextPage());
-    if (!partial) display.refresh(false);  // full clear+redraw to kill ghosting
+    if (!partial)
+        display.refresh(false); // full clear+redraw to kill ghosting
     framesDrawn++;
 }
 
 static void pollButtonsAndSend() {
-    if (!inputClient.connected()) return;
     uint32_t now = millis();
     for (size_t i = 0; i < NUM_BUTTONS; i++) {
         bool state = digitalRead(buttons[i].pin);
-        if (state == buttons[i].lastState) continue;
-        if (now - buttons[i].lastChangeMs < DEBOUNCE_MS) continue;
+        if (state == buttons[i].lastState)
+            continue;
+        if (now - buttons[i].lastChangeMs < DEBOUNCE_MS)
+            continue;
         buttons[i].lastChangeMs = now;
         buttons[i].lastState = state;
         if (state == LOW) {
-            inputClient.printf("%s\n", buttons[i].name);
-            inputClient.flush();
             Serial.printf("btn: %s\n", buttons[i].name);
+            if (inputClient.connected()) {
+                inputClient.printf("%s\n", buttons[i].name);
+                inputClient.flush();
+            }
         }
     }
 }
@@ -159,11 +165,17 @@ void setup() {
         pinMode(buttons[i].pin, INPUT_PULLUP);
     }
 
+    pinMode(EPD_PWR_PIN, OUTPUT);
+    digitalWrite(EPD_PWR_PIN, HIGH);
+    delay(10);
+
     display.init(115200);
     display.setRotation(0);
     display.setFullWindow();
     display.firstPage();
-    do { display.fillScreen(GxEPD_WHITE); } while (display.nextPage());
+    do {
+        display.fillScreen(GxEPD_WHITE);
+    } while (display.nextPage());
 
     connectWiFi();
 }
