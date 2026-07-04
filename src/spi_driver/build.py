@@ -33,6 +33,7 @@ ffi.set_source(
     '#include "spi_driver.h"',
     sources=[str(HERE / "spi_driver.c")],
     include_dirs=[str(HERE)],
+    libraries=["gpiod"],  # DC/RST/BUSY control lines via libgpiod (v1 line API)
     extra_compile_args=["-std=c11", "-Wall", "-Wextra", "-O2"],
 )
 

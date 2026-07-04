@@ -1,8 +1,10 @@
 /* GDEM0397T81P SPI driver implementation.
  *
- * GPIO is driven through libgpiod v2 (cdev API); SPI through spidev. The init
- * sequence and LUTs come from the GoodDisplay datasheet for the UC8253-class
- * controller used by this panel. Tweak EINKY_SPI_HZ if reads come back garbled.
+ * GPIO (DC/RST/BUSY) is driven through libgpiod's 1.x line API -- Buildroot
+ * ships libgpiod 1.6.5, so this is the v1 API (gpiod_chip_get_line + a per-line
+ * request), not the v2 cdev bulk-request API. SPI goes through spidev. The init
+ * sequence comes from the GoodDisplay datasheet for the UC8253-class controller
+ * used by this panel. Tweak EINKY_SPI_HZ if writes come back garbled.
  */
 
 /* nanosleep() and ioctl() are POSIX/misc, hidden under strict -std=c11 unless we
@@ -13,6 +15,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <gpiod.h>
 #include <linux/spi/spidev.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -24,18 +27,38 @@
 #define EINKY_SPI_HZ 10000000
 #define EINKY_SPI_BITS 8
 
+/* Max bytes per SPI_IOC_MESSAGE. spidev rejects a transfer whose total exceeds
+ * its `bufsiz` module parameter (default 4096) with -EMSGSIZE, so a full 48000-
+ * byte frame must be split. DC stays asserted across the chunks; only hardware
+ * CS toggles between them, which the panel tolerates during a data burst. */
+#define EINKY_SPI_CHUNK 4096
+
+/* GPIO chip that owns the BCM lines. On the Pi Zero 2 W vendor kernel the SoC
+ * bank is gpiochip0 (54 lines, BCM number == line offset). Override with
+ * $EINKY_GPIOCHIP if a kernel enumerates the bank elsewhere. */
+#define EINKY_GPIOCHIP_DEFAULT "/dev/gpiochip0"
+#define EINKY_GPIO_CONSUMER "einky-panel"
+
+/* Frame polarity. dither/pack emits bit=1 for WHITE (meta/shared/hardware.toml:
+ * packed_white_is_one=true); this panel's RAM takes bit=1 as black ink, so we
+ * invert before pushing (contract: "the SPI driver ... INVERT before drawing").
+ * Set to 0 during bring-up if the panel shows a photo negative. */
+#define EINKY_INVERT_FRAME 1
+
 /* EINKY_PANEL_*, EINKY_FRAME_BYTES, and the EINKY_PIN_* pins come from contract.h
  * (included via spi_driver.h), which is generated from meta/shared/hardware.toml. */
 
 struct einky_panel {
     int spi_fd;
-    /* Opaque GPIO handles — opened by einky_open, used by send_cmd / wait_busy.
-     * We keep them as ints so this file stays decoupled from a specific gpio
-     * library version; the actual implementation lives in gpio_backend.c when
-     * we wire up libgpiod. */
-    int dc_fd;
-    int rst_fd;
-    int busy_fd;
+    /* libgpiod handles for the control lines. The chip owns the lines, so
+     * closing it in einky_close releases DC/RST/BUSY together. */
+    struct gpiod_chip *chip;
+    struct gpiod_line *dc;
+    struct gpiod_line *rst;
+    struct gpiod_line *busy;
+    /* Scratch TX buffer for the inverted frame (see EINKY_INVERT_FRAME), sized
+     * to one full frame so push_frame never allocates on the hot path. */
+    uint8_t txbuf[EINKY_FRAME_BYTES];
 };
 
 static int spi_xfer(int fd, const uint8_t *tx, size_t len) {
@@ -49,17 +72,12 @@ static int spi_xfer(int fd, const uint8_t *tx, size_t len) {
     return ioctl(fd, SPI_IOC_MESSAGE(1), &tr) < 0 ? -1 : 0;
 }
 
-static int gpio_set(int fd, int value) {
-    /* Placeholder: real impl writes a gpiod line request. */
-    (void)fd;
-    (void)value;
-    return 0;
+static int gpio_set(struct gpiod_line *line, int value) {
+    return gpiod_line_set_value(line, value);
 }
 
-static int gpio_get(int fd) {
-    /* Placeholder: real impl reads a gpiod line. */
-    (void)fd;
-    return 0;
+static int gpio_get(struct gpiod_line *line) {
+    return gpiod_line_get_value(line);
 }
 
 static void msleep(int ms) {
@@ -70,24 +88,33 @@ static void msleep(int ms) {
 static int wait_busy(einky_panel_t *p) {
     /* BUSY is active-high on this panel; wait up to 5s. */
     for (int i = 0; i < 500; i++) {
-        if (gpio_get(p->busy_fd) == 0) {
+        int v = gpio_get(p->busy);
+        if (v < 0)
+            return -1;
+        if (v == 0)
             return 0;
-        }
         msleep(10);
     }
     return -1;
 }
 
 static int send_cmd(einky_panel_t *p, uint8_t cmd) {
-    if (gpio_set(p->dc_fd, 0) < 0)
+    if (gpio_set(p->dc, 0) < 0)
         return -1;
     return spi_xfer(p->spi_fd, &cmd, 1);
 }
 
 static int send_data(einky_panel_t *p, const uint8_t *data, size_t len) {
-    if (gpio_set(p->dc_fd, 1) < 0)
+    if (gpio_set(p->dc, 1) < 0)
         return -1;
-    return spi_xfer(p->spi_fd, data, len);
+    for (size_t off = 0; off < len; off += EINKY_SPI_CHUNK) {
+        size_t n = len - off;
+        if (n > EINKY_SPI_CHUNK)
+            n = EINKY_SPI_CHUNK;
+        if (spi_xfer(p->spi_fd, data + off, n) < 0)
+            return -1;
+    }
+    return 0;
 }
 
 einky_panel_t *einky_open(const char *spi_dev) {
@@ -112,24 +139,48 @@ einky_panel_t *einky_open(const char *spi_dev) {
         return NULL;
     }
 
-    /* TODO: open libgpiod lines for DC/RST/BUSY here. */
-    p->dc_fd = -1;
-    p->rst_fd = -1;
-    p->busy_fd = -1;
+    const char *chip_path = getenv("EINKY_GPIOCHIP");
+    if (!chip_path || !*chip_path)
+        chip_path = EINKY_GPIOCHIP_DEFAULT;
+
+    p->chip = gpiod_chip_open(chip_path);
+    if (!p->chip)
+        goto fail;
+
+    p->dc = gpiod_chip_get_line(p->chip, EINKY_PIN_DC);
+    p->rst = gpiod_chip_get_line(p->chip, EINKY_PIN_RST);
+    p->busy = gpiod_chip_get_line(p->chip, EINKY_PIN_BUSY);
+    if (!p->dc || !p->rst || !p->busy)
+        goto fail;
+
+    /* DC idles low (command mode); RST idles high (reset is active-low, so idle
+     * de-asserted); BUSY is a panel-driven input. */
+    if (gpiod_line_request_output(p->dc, EINKY_GPIO_CONSUMER, 0) < 0 ||
+        gpiod_line_request_output(p->rst, EINKY_GPIO_CONSUMER, 1) < 0 ||
+        gpiod_line_request_input(p->busy, EINKY_GPIO_CONSUMER) < 0)
+        goto fail;
 
     return p;
+
+fail:
+    if (p->chip)
+        gpiod_chip_close(p->chip); /* also releases any lines requested above */
+    if (p->spi_fd >= 0)
+        close(p->spi_fd);
+    free(p);
+    return NULL;
 }
 
 int einky_init(einky_panel_t *p) {
     if (!p)
         return -EINVAL;
 
-    /* Hardware reset */
-    gpio_set(p->rst_fd, 1);
+    /* Hardware reset (RST is active-low: pulse low, then release). */
+    gpio_set(p->rst, 1);
     msleep(10);
-    gpio_set(p->rst_fd, 0);
+    gpio_set(p->rst, 0);
     msleep(10);
-    gpio_set(p->rst_fd, 1);
+    gpio_set(p->rst, 1);
     msleep(10);
 
     /* Power settings (from GoodDisplay reference init for UC8253). */
@@ -159,8 +210,15 @@ static int push_frame(einky_panel_t *p, uint8_t cmd, const uint8_t *frame, size_
         return -EINVAL;
     if (send_cmd(p, cmd) < 0)
         return -1;
-    if (send_data(p, frame, len) < 0)
-        return -1;
+    if (EINKY_INVERT_FRAME) {
+        for (size_t i = 0; i < len; i++)
+            p->txbuf[i] = (uint8_t)~frame[i];
+        if (send_data(p, p->txbuf, len) < 0)
+            return -1;
+    } else {
+        if (send_data(p, frame, len) < 0)
+            return -1;
+    }
     if (send_cmd(p, 0x12) < 0)
         return -1; /* DISPLAY_REFRESH */
     return wait_busy(p);
@@ -192,6 +250,9 @@ int einky_sleep(einky_panel_t *p) {
 void einky_close(einky_panel_t *p) {
     if (!p)
         return;
+    /* Closing the chip releases DC/RST/BUSY; do it before dropping the SPI fd. */
+    if (p->chip)
+        gpiod_chip_close(p->chip);
     if (p->spi_fd >= 0)
         close(p->spi_fd);
     free(p);
