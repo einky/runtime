@@ -1,5 +1,12 @@
 [build-system]
-requires = ["setuptools>=68", "wheel", "cffi>=1.16"]
+# cffi is intentionally NOT a build requirement: this wheel is pure-Python (the
+# _spi_driver C extension is compiled separately via `python -m spi_driver.build`,
+# not by this backend). Listing cffi here makes `python -m build --no-isolation`
+# demand it at wheel-build time, which breaks non-SPI targets (e.g. the emulator)
+# whose Buildroot env has no host-python-cffi. cffi is pulled in only where it is
+# actually used: the SPI extension build + runtime (buildroot_os inky-runtime SPI
+# branch), and the dev venv (see the `make build-c` fallback).
+requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
