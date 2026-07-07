@@ -19,7 +19,7 @@ requires-python = ">=3.11"
 dependencies = [
     "pillow>=10.2",
     "numpy>=1.26",
-    "gpiozero>=2.0",
+    "gpiod>=2.1",
     "cffi>=1.16",
 ]
 
@@ -82,7 +82,7 @@ namespace_packages = true
 explicit_package_bases = true
 
 [[tool.mypy.overrides]]
-module = ["gpiozero.*", "cffi.*", "_spi_driver.*"]
+module = ["gpiod.*", "cffi.*", "_spi_driver.*"]
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]

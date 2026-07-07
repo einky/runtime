@@ -24,7 +24,7 @@ launcher Canvas / game PNGs --> frame_processor/                -> spi_driver/ (
                                 dither -> pack 1-bit (MSB)      -> SocketSink/TcpFrameSink (dev preview)
 
 input                           input/
-7x GPIO (gpiozero) / TCP    --> keymap.py (generated from the contract)
+7x GPIO (gpiod) / TCP    --> keymap.py (generated from the contract)
                                 net_sender.py -> a game's input socket
 ```
 

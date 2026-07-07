@@ -29,5 +29,5 @@ BUTTON_MAP: tuple[ButtonBinding, ...] = (
     ButtonBinding("start", gpio=21, key="Return"),
 )
 
-# gpiozero bounce_time: the suppression window after a transition (debounce_ms).
+# Kernel-side debounce: the suppression window after a transition (debounce_ms).
 DEBOUNCE_SECONDS = 0.03
