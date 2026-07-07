@@ -1,7 +1,7 @@
 /* GDEM0397T81P SPI driver: minimal init / refresh / sleep API.
  *
  * The panel is a 3.97" 800x480 1-bit e-paper module from GoodDisplay using a
- * UC8253-class controller. Panel geometry and the SPI / control pins come from
+ * Solomon Systech SSD1677 controller. Panel geometry and the SPI / control pins come from
  * the shared contract via contract.h (generated from meta/shared/hardware.toml);
  * do not hard-code them here.
  */

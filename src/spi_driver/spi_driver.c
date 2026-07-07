@@ -1,11 +1,18 @@
 /* GDEM0397T81P SPI driver implementation.
  *
+ * The panel's controller is the Solomon Systech SSD1677 (confirmed from the
+ * GoodDisplay product page / datasheet). This is a Solomon-style controller,
+ * NOT the UC8253/IL0398 family an earlier stub assumed -- the command set is
+ * entirely different (write RAM 0x24, display-update-control 0x22, master
+ * activation 0x20), which is why the old sequence "succeeded" over SPI while
+ * the panel never refreshed. Sequence below follows the SSD1677 datasheet and
+ * GoodDisplay's reference init for 800x480.
+ *
  * GPIO (DC/RST/BUSY) is driven through libgpiod's 2.x API (one bulk line
- * request on the chip's character device). The image ships libgpiod2 -- the
- * v1 library can't coexist with it (or with the python-gpiod button reader),
- * so this file must stay on the v2 API. SPI goes through spidev. The init
- * sequence comes from the GoodDisplay datasheet for the UC8253-class controller
- * used by this panel. Tweak EINKY_SPI_HZ if writes come back garbled.
+ * request on the chip's character device). SPI goes through spidev.
+ *
+ * Bring-up knobs (env, no rebuild): EINKY_GPIOCHIP, EINKY_SPI_HZ,
+ * EINKY_INVERT_FRAME, EINKY_SPI_DEBUG. See einky_open / push_frame.
  */
 
 /* nanosleep() and ioctl() are POSIX/misc, hidden under strict -std=c11 unless we
@@ -18,6 +25,7 @@
 #include <fcntl.h>
 #include <gpiod.h>
 #include <linux/spi/spidev.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -25,7 +33,7 @@
 #include <time.h>
 #include <unistd.h>
 
-#define EINKY_SPI_HZ 10000000
+#define EINKY_SPI_HZ_DEFAULT 10000000
 #define EINKY_SPI_BITS 8
 
 /* Max bytes per SPI_IOC_MESSAGE. spidev rejects a transfer whose total exceeds
@@ -35,40 +43,73 @@
 #define EINKY_SPI_CHUNK 4096
 
 /* GPIO chip that owns the BCM lines. On the Pi Zero 2 W vendor kernel the SoC
- * bank is gpiochip0 (54 lines, BCM number == line offset). Override with
- * $EINKY_GPIOCHIP if a kernel enumerates the bank elsewhere. */
+ * bank is gpiochip0 (BCM number == line offset). Override with $EINKY_GPIOCHIP. */
 #define EINKY_GPIOCHIP_DEFAULT "/dev/gpiochip0"
 #define EINKY_GPIO_CONSUMER "einky-panel"
 
-/* Frame polarity. dither/pack emits bit=1 for WHITE (meta/shared/hardware.toml:
- * packed_white_is_one=true); this panel's RAM takes bit=1 as black ink, so we
- * invert before pushing (contract: "the SPI driver ... INVERT before drawing").
- * Set to 0 during bring-up if the panel shows a photo negative. */
-#define EINKY_INVERT_FRAME 1
+/* Bytes per packed row (800 px / 8) and gate line count. Derived from the
+ * contract geometry so a panel-size change in the contract flows through. */
+#define EINKY_BYTES_PER_ROW (EINKY_FRAME_BYTES / EINKY_PANEL_H)
+#define EINKY_GATE_LINES EINKY_PANEL_H
 
-/* EINKY_PANEL_*, EINKY_FRAME_BYTES, and the EINKY_PIN_* pins come from contract.h
- * (included via spi_driver.h), which is generated from meta/shared/hardware.toml. */
+/* ── SSD1677 command set (datasheet) ─────────────────────────────────────── */
+#define SSD1677_SW_RESET 0x12
+#define SSD1677_TEMP_SENSOR 0x18
+#define SSD1677_BOOSTER_SOFT_START 0x0C
+#define SSD1677_DRIVER_OUTPUT 0x01
+#define SSD1677_BORDER_WAVEFORM 0x3C
+#define SSD1677_DATA_ENTRY 0x11
+#define SSD1677_SET_RAM_X 0x44
+#define SSD1677_SET_RAM_Y 0x45
+#define SSD1677_SET_RAM_X_COUNT 0x4E
+#define SSD1677_SET_RAM_Y_COUNT 0x4F
+#define SSD1677_WRITE_RAM_BW 0x24
+#define SSD1677_UPDATE_CTRL2 0x22
+#define SSD1677_MASTER_ACTIVATE 0x20
+#define SSD1677_DEEP_SLEEP 0x10
+
+/* Full-update sequence for 0x22: enable clock + analog, load temp value, load
+ * LUT (display mode 1), display, then disable analog + clock. */
+#define SSD1677_UPDATE_FULL 0xF7
 
 struct einky_panel {
     int spi_fd;
+    uint32_t spi_hz;
+    int invert; /* XOR the frame before writing RAM (photo-negative fix). */
+    int debug;  /* extra stderr logging for bring-up. */
     /* libgpiod v2 handles: one bulk request owns DC/RST/BUSY together, so
      * releasing it in einky_close frees all three lines at once. */
     struct gpiod_chip *chip;
     struct gpiod_line_request *lines;
-    /* Scratch TX buffer for the inverted frame (see EINKY_INVERT_FRAME), sized
-     * to one full frame so push_frame never allocates on the hot path. */
+    /* Scratch TX buffer for the (optionally inverted) frame, sized to one full
+     * frame so push_frame never allocates on the hot path. */
     uint8_t txbuf[EINKY_FRAME_BYTES];
 };
 
-static int spi_xfer(int fd, const uint8_t *tx, size_t len) {
+static void einky_log(const char *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    vfprintf(stderr, fmt, ap);
+    va_end(ap);
+    fputc('\n', stderr);
+}
+
+static int env_int(const char *name, int fallback) {
+    const char *v = getenv(name);
+    if (!v || !*v)
+        return fallback;
+    return (int)strtol(v, NULL, 0);
+}
+
+static int spi_xfer(einky_panel_t *p, const uint8_t *tx, size_t len) {
     struct spi_ioc_transfer tr = {
         .tx_buf = (uintptr_t)tx,
         .rx_buf = 0,
         .len = (uint32_t)len,
-        .speed_hz = EINKY_SPI_HZ,
+        .speed_hz = p->spi_hz,
         .bits_per_word = EINKY_SPI_BITS,
     };
-    return ioctl(fd, SPI_IOC_MESSAGE(1), &tr) < 0 ? -1 : 0;
+    return ioctl(p->spi_fd, SPI_IOC_MESSAGE(1), &tr) < 0 ? -1 : 0;
 }
 
 static int gpio_set(struct gpiod_line_request *lines, unsigned int offset, int value) {
@@ -77,14 +118,58 @@ static int gpio_set(struct gpiod_line_request *lines, unsigned int offset, int v
 }
 
 static int gpio_get(struct gpiod_line_request *lines, unsigned int offset) {
-    /* GPIOD_LINE_VALUE_ERROR/INACTIVE/ACTIVE map to -1/0/1, same contract as
-     * the v1 gpiod_line_get_value this replaced. */
+    /* GPIOD_LINE_VALUE_ERROR/INACTIVE/ACTIVE map to -1/0/1. */
     return (int)gpiod_line_request_get_value(lines, offset);
 }
 
 static void msleep(int ms) {
     struct timespec ts = {ms / 1000, (ms % 1000) * 1000000L};
     nanosleep(&ts, NULL);
+}
+
+/* SSD1677 BUSY is active-HIGH: the controller holds it high during an update
+ * and releases it low when idle. Wait up to 30s (a full refresh is ~1.5s, but
+ * a cold panel is slower). A stuck-high BUSY errors out rather than hanging. */
+static int wait_busy(einky_panel_t *p) {
+    for (int i = 0; i < 3000; i++) {
+        int v = gpio_get(p->lines, EINKY_PIN_BUSY);
+        if (v < 0)
+            return -1;
+        if (v == 0) {
+            if (p->debug && i)
+                einky_log("einky: BUSY cleared after ~%d ms", i * 10);
+            return 0;
+        }
+        msleep(10);
+    }
+    einky_log("einky: ERROR BUSY stuck high >30s (check wiring/polarity)");
+    return -1;
+}
+
+static int send_cmd(einky_panel_t *p, uint8_t cmd) {
+    if (gpio_set(p->lines, EINKY_PIN_DC, 0) < 0)
+        return -1;
+    return spi_xfer(p, &cmd, 1);
+}
+
+static int send_data(einky_panel_t *p, const uint8_t *data, size_t len) {
+    if (gpio_set(p->lines, EINKY_PIN_DC, 1) < 0)
+        return -1;
+    for (size_t off = 0; off < len; off += EINKY_SPI_CHUNK) {
+        size_t n = len - off;
+        if (n > EINKY_SPI_CHUNK)
+            n = EINKY_SPI_CHUNK;
+        if (spi_xfer(p, data + off, n) < 0)
+            return -1;
+    }
+    return 0;
+}
+
+/* Command followed by a short inline data payload (init registers). */
+static int send_cmd_data(einky_panel_t *p, uint8_t cmd, const uint8_t *data, size_t len) {
+    if (send_cmd(p, cmd) < 0)
+        return -1;
+    return len ? send_data(p, data, len) : 0;
 }
 
 /* One bulk v2 request for the three control lines. DC idles low (command
@@ -127,55 +212,29 @@ out:
     return req;
 }
 
-static int wait_busy(einky_panel_t *p) {
-    /* BUSY is active-high on this panel; wait up to 5s. */
-    for (int i = 0; i < 500; i++) {
-        int v = gpio_get(p->lines, EINKY_PIN_BUSY);
-        if (v < 0)
-            return -1;
-        if (v == 0)
-            return 0;
-        msleep(10);
-    }
-    return -1;
-}
-
-static int send_cmd(einky_panel_t *p, uint8_t cmd) {
-    if (gpio_set(p->lines, EINKY_PIN_DC, 0) < 0)
-        return -1;
-    return spi_xfer(p->spi_fd, &cmd, 1);
-}
-
-static int send_data(einky_panel_t *p, const uint8_t *data, size_t len) {
-    if (gpio_set(p->lines, EINKY_PIN_DC, 1) < 0)
-        return -1;
-    for (size_t off = 0; off < len; off += EINKY_SPI_CHUNK) {
-        size_t n = len - off;
-        if (n > EINKY_SPI_CHUNK)
-            n = EINKY_SPI_CHUNK;
-        if (spi_xfer(p->spi_fd, data + off, n) < 0)
-            return -1;
-    }
-    return 0;
-}
-
 einky_panel_t *einky_open(const char *spi_dev) {
     einky_panel_t *p = calloc(1, sizeof(*p));
     if (!p)
         return NULL;
 
+    p->spi_hz = (uint32_t)env_int("EINKY_SPI_HZ", EINKY_SPI_HZ_DEFAULT);
+    p->invert = env_int("EINKY_INVERT_FRAME", 0);
+    p->debug = env_int("EINKY_SPI_DEBUG", 0);
+
     p->spi_fd = open(spi_dev, O_RDWR);
     if (p->spi_fd < 0) {
+        einky_log("einky: open(%s) failed: %s", spi_dev, strerror(errno));
         free(p);
         return NULL;
     }
 
     uint32_t mode = SPI_MODE_0;
     uint8_t bits = EINKY_SPI_BITS;
-    uint32_t hz = EINKY_SPI_HZ;
+    uint32_t hz = p->spi_hz;
     if (ioctl(p->spi_fd, SPI_IOC_WR_MODE32, &mode) < 0 ||
         ioctl(p->spi_fd, SPI_IOC_WR_BITS_PER_WORD, &bits) < 0 ||
         ioctl(p->spi_fd, SPI_IOC_WR_MAX_SPEED_HZ, &hz) < 0) {
+        einky_log("einky: spidev ioctl failed: %s", strerror(errno));
         close(p->spi_fd);
         free(p);
         return NULL;
@@ -186,13 +245,20 @@ einky_panel_t *einky_open(const char *spi_dev) {
         chip_path = EINKY_GPIOCHIP_DEFAULT;
 
     p->chip = gpiod_chip_open(chip_path);
-    if (!p->chip)
+    if (!p->chip) {
+        einky_log("einky: gpiod_chip_open(%s) failed: %s", chip_path, strerror(errno));
         goto fail;
+    }
 
     p->lines = request_control_lines(p->chip);
-    if (!p->lines)
+    if (!p->lines) {
+        einky_log("einky: request DC/RST/BUSY on %s failed: %s (line already in use?)", chip_path,
+                  strerror(errno));
         goto fail;
+    }
 
+    einky_log("einky: SSD1677 open ok (spi=%s %u Hz, invert=%d, chip=%s)", spi_dev, p->spi_hz,
+              p->invert, chip_path);
     return p;
 
 fail:
@@ -204,80 +270,136 @@ fail:
     return NULL;
 }
 
+/* Set the RAM address window to the full panel and home the address counter.
+ * X is in bytes (8 px each); Y in gate lines. Data-entry 0x03 = X++ then Y++,
+ * which matches our row-major MSB-first packed frame. */
+static int set_ram_window(einky_panel_t *p) {
+    const uint8_t entry[] = {0x03};
+    const uint8_t xr[] = {0x00, EINKY_BYTES_PER_ROW - 1};
+    const uint8_t yr[] = {0x00, 0x00, (EINKY_GATE_LINES - 1) & 0xFF, (EINKY_GATE_LINES - 1) >> 8};
+    const uint8_t xc[] = {0x00};
+    const uint8_t yc[] = {0x00, 0x00};
+
+    if (send_cmd_data(p, SSD1677_DATA_ENTRY, entry, sizeof(entry)) < 0)
+        return -1;
+    if (send_cmd_data(p, SSD1677_SET_RAM_X, xr, sizeof(xr)) < 0)
+        return -1;
+    if (send_cmd_data(p, SSD1677_SET_RAM_Y, yr, sizeof(yr)) < 0)
+        return -1;
+    if (send_cmd_data(p, SSD1677_SET_RAM_X_COUNT, xc, sizeof(xc)) < 0)
+        return -1;
+    if (send_cmd_data(p, SSD1677_SET_RAM_Y_COUNT, yc, sizeof(yc)) < 0)
+        return -1;
+    return 0;
+}
+
 int einky_init(einky_panel_t *p) {
     if (!p)
         return -EINVAL;
 
-    /* Hardware reset (RST is active-low: pulse low, then release). */
+    /* Hardware reset (RST active-low: idle high, pulse low >=10ms, release). */
     gpio_set(p->lines, EINKY_PIN_RST, 1);
     msleep(10);
     gpio_set(p->lines, EINKY_PIN_RST, 0);
     msleep(10);
     gpio_set(p->lines, EINKY_PIN_RST, 1);
     msleep(10);
-
-    /* Power settings (from GoodDisplay reference init for UC8253). */
-    static const uint8_t pwr[] = {0x03, 0x00, 0x2b, 0x2b, 0x09};
-    static const uint8_t booster[] = {0x17, 0x17, 0x17};
-
-    if (send_cmd(p, 0x01) < 0)
-        return -1; /* POWER_SETTING */
-    if (send_data(p, pwr, sizeof(pwr)) < 0)
-        return -1;
-    if (send_cmd(p, 0x06) < 0)
-        return -1; /* BOOSTER_SOFT_START */
-    if (send_data(p, booster, sizeof(booster)) < 0)
-        return -1;
-    if (send_cmd(p, 0x04) < 0)
-        return -1; /* POWER_ON */
     if (wait_busy(p) < 0)
         return -1;
 
+    /* Software reset re-loads the OTP defaults; wait for it to settle. */
+    if (send_cmd(p, SSD1677_SW_RESET) < 0)
+        return -1;
+    if (wait_busy(p) < 0)
+        return -1;
+
+    /* Internal temperature sensor (controller picks the waveform from OTP). */
+    const uint8_t temp[] = {0x80};
+    if (send_cmd_data(p, SSD1677_TEMP_SENSOR, temp, sizeof(temp)) < 0)
+        return -1;
+
+    /* Booster soft-start (GoodDisplay SSD1677 reference values). */
+    const uint8_t booster[] = {0xAE, 0xC7, 0xC3, 0xC0, 0x80};
+    if (send_cmd_data(p, SSD1677_BOOSTER_SOFT_START, booster, sizeof(booster)) < 0)
+        return -1;
+
+    /* Driver output control: number of gate lines (H-1), scan settings 0x00. */
+    const uint8_t drv[] = {(EINKY_GATE_LINES - 1) & 0xFF, (EINKY_GATE_LINES - 1) >> 8, 0x00};
+    if (send_cmd_data(p, SSD1677_DRIVER_OUTPUT, drv, sizeof(drv)) < 0)
+        return -1;
+
+    /* Border: follow the LUT for a clean white border on full refresh. */
+    const uint8_t border[] = {0x01};
+    if (send_cmd_data(p, SSD1677_BORDER_WAVEFORM, border, sizeof(border)) < 0)
+        return -1;
+
+    if (set_ram_window(p) < 0)
+        return -1;
+    if (wait_busy(p) < 0)
+        return -1;
+
+    einky_log("einky: init ok (%dx%d, %d gate lines, %d bytes/row)", EINKY_PANEL_W, EINKY_PANEL_H,
+              EINKY_GATE_LINES, EINKY_BYTES_PER_ROW);
     return 0;
 }
 
-static int push_frame(einky_panel_t *p, uint8_t cmd, const uint8_t *frame, size_t len) {
+static int push_frame(einky_panel_t *p, const uint8_t *frame, size_t len) {
     if (!p || !frame)
         return -EINVAL;
     if (len != EINKY_FRAME_BYTES)
         return -EINVAL;
-    if (send_cmd(p, cmd) < 0)
+
+    /* Home the address counter, then stream the frame into BW RAM. SSD1677 BW
+     * RAM: bit 1 = white, matching the contract's packed_white_is_one, so we
+     * write the packed frame as-is by default (EINKY_INVERT_FRAME=1 flips it
+     * if the panel comes up as a photo-negative). */
+    const uint8_t xc[] = {0x00};
+    const uint8_t yc[] = {0x00, 0x00};
+    if (send_cmd_data(p, SSD1677_SET_RAM_X_COUNT, xc, sizeof(xc)) < 0)
         return -1;
-    if (EINKY_INVERT_FRAME) {
+    if (send_cmd_data(p, SSD1677_SET_RAM_Y_COUNT, yc, sizeof(yc)) < 0)
+        return -1;
+
+    if (send_cmd(p, SSD1677_WRITE_RAM_BW) < 0)
+        return -1;
+    if (p->invert) {
         for (size_t i = 0; i < len; i++)
             p->txbuf[i] = (uint8_t)~frame[i];
         if (send_data(p, p->txbuf, len) < 0)
             return -1;
-    } else {
-        if (send_data(p, frame, len) < 0)
-            return -1;
+    } else if (send_data(p, frame, len) < 0) {
+        return -1;
     }
-    if (send_cmd(p, 0x12) < 0)
-        return -1; /* DISPLAY_REFRESH */
+
+    /* Trigger the update: load the full-refresh sequence, then activate. */
+    const uint8_t upd[] = {SSD1677_UPDATE_FULL};
+    if (send_cmd_data(p, SSD1677_UPDATE_CTRL2, upd, sizeof(upd)) < 0)
+        return -1;
+    if (send_cmd(p, SSD1677_MASTER_ACTIVATE) < 0)
+        return -1;
+    if (p->debug)
+        einky_log("einky: refresh activated, waiting BUSY");
     return wait_busy(p);
 }
 
 int einky_full_refresh(einky_panel_t *p, const uint8_t *frame, size_t len) {
-    return push_frame(p, 0x13, frame, len); /* DATA_START_TRANSMISSION_2 (new image) */
+    return push_frame(p, frame, len);
 }
 
 int einky_partial_refresh(einky_panel_t *p, const uint8_t *frame, size_t len) {
-    /* TODO: switch to partial LUT before pushing. For now we re-use the full
-     * path so the surface compiles and the python tests can drive it. */
-    return push_frame(p, 0x13, frame, len);
+    /* TODO: SSD1677 partial update uses a differential (0x24 + 0x26) write and
+     * a 0x22=0xFF/0xCF sequence with a partial border. For now re-use the full
+     * path so callers get a correct (if flashier) refresh. */
+    return push_frame(p, frame, len);
 }
 
 int einky_sleep(einky_panel_t *p) {
     if (!p)
         return -EINVAL;
-    if (send_cmd(p, 0x02) < 0)
-        return -1; /* POWER_OFF */
-    if (wait_busy(p) < 0)
-        return -1;
-    static const uint8_t deep[] = {0xa5};
-    if (send_cmd(p, 0x07) < 0)
-        return -1; /* DEEP_SLEEP */
-    return send_data(p, deep, sizeof(deep));
+    /* Deep sleep mode 1: lowest power, retains the displayed image. A hardware
+     * reset + einky_init is required to wake (the launcher re-inits on wake). */
+    const uint8_t deep[] = {0x01};
+    return send_cmd_data(p, SSD1677_DEEP_SLEEP, deep, sizeof(deep));
 }
 
 void einky_close(einky_panel_t *p) {
