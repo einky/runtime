@@ -64,6 +64,8 @@
 #define SSD1677_SET_RAM_X_COUNT 0x4E
 #define SSD1677_SET_RAM_Y_COUNT 0x4F
 #define SSD1677_WRITE_RAM_BW 0x24
+#define SSD1677_WRITE_RAM_RED 0x26
+#define SSD1677_UPDATE_CTRL1 0x21
 #define SSD1677_UPDATE_CTRL2 0x22
 #define SSD1677_MASTER_ACTIVATE 0x20
 #define SSD1677_DEEP_SLEEP 0x10
@@ -71,12 +73,19 @@
 /* Full-update sequence for 0x22: enable clock + analog, load temp value, load
  * LUT (display mode 1), display, then disable analog + clock. */
 #define SSD1677_UPDATE_FULL 0xF7
+/* Partial-update sequence: display mode 2, a no-flash differential against the
+ * previous image held in the RED RAM (0x26). */
+#define SSD1677_UPDATE_PART 0xFC
 
 struct einky_panel {
     int spi_fd;
     uint32_t spi_hz;
     int invert; /* XOR the frame before writing RAM (photo-negative fix). */
     int debug;  /* extra stderr logging for bring-up. */
+    /* Set once a full refresh has stocked the previous-image RAM (0x26); a
+     * partial refresh before that would differential against power-on noise,
+     * so it is promoted to a full refresh. Cleared by einky_init. */
+    int did_full;
     /* libgpiod v2 handles: one bulk request owns DC/RST/BUSY together, so
      * releasing it in einky_close frees all three lines at once. */
     struct gpiod_chip *chip;
@@ -101,13 +110,14 @@ static int env_int(const char *name, int fallback) {
     return (int)strtol(v, NULL, 0);
 }
 
-static int spi_xfer(einky_panel_t *p, const uint8_t *tx, size_t len) {
+static int spi_xfer(einky_panel_t *p, const uint8_t *tx, size_t len, uint8_t cs_change) {
     struct spi_ioc_transfer tr = {
         .tx_buf = (uintptr_t)tx,
         .rx_buf = 0,
         .len = (uint32_t)len,
         .speed_hz = p->spi_hz,
         .bits_per_word = EINKY_SPI_BITS,
+        .cs_change = cs_change,
     };
     return ioctl(p->spi_fd, SPI_IOC_MESSAGE(1), &tr) < 0 ? -1 : 0;
 }
@@ -149,7 +159,7 @@ static int wait_busy(einky_panel_t *p) {
 static int send_cmd(einky_panel_t *p, uint8_t cmd) {
     if (gpio_set(p->lines, EINKY_PIN_DC, 0) < 0)
         return -1;
-    return spi_xfer(p, &cmd, 1);
+    return spi_xfer(p, &cmd, 1, 0);
 }
 
 static int send_data(einky_panel_t *p, const uint8_t *data, size_t len) {
@@ -159,7 +169,9 @@ static int send_data(einky_panel_t *p, const uint8_t *data, size_t len) {
         size_t n = len - off;
         if (n > EINKY_SPI_CHUNK)
             n = EINKY_SPI_CHUNK;
-        if (spi_xfer(p, data + off, n) < 0)
+
+        uint8_t cs_change = (off + n < len) ? 1 : 0;
+        if (spi_xfer(p, data + off, n, cs_change) < 0)
             return -1;
     }
     return 0;
@@ -271,14 +283,24 @@ fail:
 }
 
 /* Set the RAM address window to the full panel and home the address counter.
- * X is in bytes (8 px each); Y in gate lines. Data-entry 0x03 = X++ then Y++,
- * which matches our row-major MSB-first packed frame. */
+ * Two SSD1677 traps here (both confirmed by the GxEPD2 reference driver for
+ * this exact panel, GxEPD2_397_GDEM0397T81::_setPartialRamArea, and the
+ * SSD1677 datasheet):
+ *
+ *  - X addresses are 10-bit and in PIXELS: 0x44 takes 4 data bytes (start
+ *    lo/hi, end lo/hi) and 0x4E takes 2. The SSD168x-style single-byte,
+ *    byte-indexed form under-feeds the commands, leaving a garbage window that
+ *    wraps every write -- the whole panel renders as static.
+ *  - The panel's gates are reversed relative to our top-down frame and the
+ *    controller has no gate-reverse scan, so data entry is X-increment /
+ *    Y-DECREMENT (0x01) with the Y window and counter starting at the bottom
+ *    gate line (H-1). */
 static int set_ram_window(einky_panel_t *p) {
-    const uint8_t entry[] = {0x03};
-    const uint8_t xr[] = {0x00, EINKY_BYTES_PER_ROW - 1};
-    const uint8_t yr[] = {0x00, 0x00, (EINKY_GATE_LINES - 1) & 0xFF, (EINKY_GATE_LINES - 1) >> 8};
-    const uint8_t xc[] = {0x00};
-    const uint8_t yc[] = {0x00, 0x00};
+    const uint8_t entry[] = {0x01};
+    const uint8_t xr[] = {0x00, 0x00, (EINKY_PANEL_W - 1) & 0xFF, (EINKY_PANEL_W - 1) >> 8};
+    const uint8_t yr[] = {(EINKY_GATE_LINES - 1) & 0xFF, (EINKY_GATE_LINES - 1) >> 8, 0x00, 0x00};
+    const uint8_t xc[] = {0x00, 0x00};
+    const uint8_t yc[] = {(EINKY_GATE_LINES - 1) & 0xFF, (EINKY_GATE_LINES - 1) >> 8};
 
     if (send_cmd_data(p, SSD1677_DATA_ENTRY, entry, sizeof(entry)) < 0)
         return -1;
@@ -296,6 +318,7 @@ static int set_ram_window(einky_panel_t *p) {
 int einky_init(einky_panel_t *p) {
     if (!p)
         return -EINVAL;
+    p->did_full = 0;
 
     /* Hardware reset (RST active-low: idle high, pulse low >=10ms, release). */
     gpio_set(p->lines, EINKY_PIN_RST, 1);
@@ -323,8 +346,10 @@ int einky_init(einky_panel_t *p) {
     if (send_cmd_data(p, SSD1677_BOOSTER_SOFT_START, booster, sizeof(booster)) < 0)
         return -1;
 
-    /* Driver output control: number of gate lines (H-1), scan settings 0x00. */
-    const uint8_t drv[] = {(EINKY_GATE_LINES - 1) & 0xFF, (EINKY_GATE_LINES - 1) >> 8, 0x00};
+    /* Driver output control: number of gate lines (H-1), scan settings 0x02
+     * (gate scan order for this glass -- GxEPD2 reference value; 0x00
+     * interleaves the gate lines). */
+    const uint8_t drv[] = {(EINKY_GATE_LINES - 1) & 0xFF, (EINKY_GATE_LINES - 1) >> 8, 0x02};
     if (send_cmd_data(p, SSD1677_DRIVER_OUTPUT, drv, sizeof(drv)) < 0)
         return -1;
 
@@ -343,54 +368,72 @@ int einky_init(einky_panel_t *p) {
     return 0;
 }
 
-static int push_frame(einky_panel_t *p, const uint8_t *frame, size_t len) {
+/* Re-arm the RAM window / address counter and stream the frame into one RAM
+ * plane (BW 0x24 or RED-as-previous 0x26). SSD1677 BW RAM: bit 1 = white,
+ * matching the contract's packed_white_is_one, so we write the packed frame
+ * as-is by default (EINKY_INVERT_FRAME=1 flips it if the panel comes up as a
+ * photo-negative). */
+static int write_ram(einky_panel_t *p, uint8_t ram_cmd, const uint8_t *frame, size_t len) {
+    const uint8_t *src = frame;
+    if (set_ram_window(p) < 0)
+        return -1;
+    if (send_cmd(p, ram_cmd) < 0)
+        return -1;
+    if (p->invert) {
+        for (size_t i = 0; i < len; i++)
+            p->txbuf[i] = (uint8_t)~frame[i];
+        src = p->txbuf;
+    }
+    return send_data(p, src, len);
+}
+
+static int push_frame(einky_panel_t *p, const uint8_t *frame, size_t len, int full) {
     if (!p || !frame)
         return -EINVAL;
     if (len != EINKY_FRAME_BYTES)
         return -EINVAL;
 
-    /* Home the address counter, then stream the frame into BW RAM. SSD1677 BW
-     * RAM: bit 1 = white, matching the contract's packed_white_is_one, so we
-     * write the packed frame as-is by default (EINKY_INVERT_FRAME=1 flips it
-     * if the panel comes up as a photo-negative). */
-    const uint8_t xc[] = {0x00};
-    const uint8_t yc[] = {0x00, 0x00};
-    if (send_cmd_data(p, SSD1677_SET_RAM_X_COUNT, xc, sizeof(xc)) < 0)
+    /* Display mode 2 (partial) is a differential against the previous-image
+     * RAM, which holds power-on noise until a full refresh has stocked it. */
+    if (!p->did_full)
+        full = 1;
+
+    /* A full refresh also stocks the previous-image RAM so the next partial
+     * differentials against what is actually on the glass; partials only
+     * rewrite the BW RAM (the mode-2 update sequence ping-pongs it into the
+     * previous-image RAM itself). */
+    if (full && write_ram(p, SSD1677_WRITE_RAM_RED, frame, len) < 0)
         return -1;
-    if (send_cmd_data(p, SSD1677_SET_RAM_Y_COUNT, yc, sizeof(yc)) < 0)
+    if (write_ram(p, SSD1677_WRITE_RAM_BW, frame, len) < 0)
         return -1;
 
-    if (send_cmd(p, SSD1677_WRITE_RAM_BW) < 0)
+    /* Display update control 1: full bypasses the RED RAM as 0 (plain BW
+     * refresh); partial reads it as the previous image. */
+    const uint8_t ctrl1[] = {full ? 0x40 : 0x00, 0x00};
+    if (send_cmd_data(p, SSD1677_UPDATE_CTRL1, ctrl1, sizeof(ctrl1)) < 0)
         return -1;
-    if (p->invert) {
-        for (size_t i = 0; i < len; i++)
-            p->txbuf[i] = (uint8_t)~frame[i];
-        if (send_data(p, p->txbuf, len) < 0)
-            return -1;
-    } else if (send_data(p, frame, len) < 0) {
-        return -1;
-    }
 
-    /* Trigger the update: load the full-refresh sequence, then activate. */
-    const uint8_t upd[] = {SSD1677_UPDATE_FULL};
+    /* Trigger the update: load the refresh sequence, then activate. */
+    const uint8_t upd[] = {full ? SSD1677_UPDATE_FULL : SSD1677_UPDATE_PART};
     if (send_cmd_data(p, SSD1677_UPDATE_CTRL2, upd, sizeof(upd)) < 0)
         return -1;
     if (send_cmd(p, SSD1677_MASTER_ACTIVATE) < 0)
         return -1;
     if (p->debug)
-        einky_log("einky: refresh activated, waiting BUSY");
-    return wait_busy(p);
+        einky_log("einky: %s refresh activated, waiting BUSY", full ? "full" : "partial");
+    if (wait_busy(p) < 0)
+        return -1;
+    if (full)
+        p->did_full = 1;
+    return 0;
 }
 
 int einky_full_refresh(einky_panel_t *p, const uint8_t *frame, size_t len) {
-    return push_frame(p, frame, len);
+    return push_frame(p, frame, len, 1);
 }
 
 int einky_partial_refresh(einky_panel_t *p, const uint8_t *frame, size_t len) {
-    /* TODO: SSD1677 partial update uses a differential (0x24 + 0x26) write and
-     * a 0x22=0xFF/0xCF sequence with a partial border. For now re-use the full
-     * path so callers get a correct (if flashier) refresh. */
-    return push_frame(p, frame, len);
+    return push_frame(p, frame, len, 0);
 }
 
 int einky_sleep(einky_panel_t *p) {
