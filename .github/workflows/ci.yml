@@ -59,3 +59,15 @@ jobs:
           # gen_from_contract.py resolves by default (../meta/shared/hardware.toml).
           # Re-renders every committed constant file and fails on any drift.
           python runtime/scripts/gen_from_contract.py --check
+
+  # A runtime change must not break the emulator boot/pipeline: build the image
+  # with THIS runtime branch (OVERRIDE_SRCDIR) and run the A1 acceptance test.
+  # Skippable with a `docs-only` label. See einky/buildroot_os image-e2e.yml.
+  image-e2e:
+    name: emulator image + A1
+    if: ${{ github.event_name != 'pull_request' || !contains(github.event.pull_request.labels.*.name, 'docs-only') }}
+    uses: einky/buildroot_os/.github/workflows/image-e2e.yml@main
+    with:
+      runtime_ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      # buildroot_os / launcher / meta default to main.
+    secrets: inherit
