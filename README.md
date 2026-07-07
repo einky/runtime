@@ -1,55 +1,45 @@
 # runtime
 
-User-space code that runs on the Einky Pi handheld at boot, **except** the
-launcher (in `einky/launcher`) and the Ren'Py SDK (installed by `einky/os`).
+The **shared on-device library** of the Einky Pi handheld: the single owner
+(ADR 0008) of the e-ink frame pipeline, the contract keymap, and the C SPI
+panel driver. It is consumed two ways:
 
-The runtime has two responsibilities:
+- **imported by the launcher** (`einky/launcher`, ADR 0009) — the app the
+  device boots into uses `spi_driver.open_panel()`, the
+  `frame_processor` dither/pack pipeline, `input.keymap`, and
+  `input.net_sender` for the launcher↔game bridge;
+- **packaged into InkyOS** by `buildroot_os` as the `inky-runtime` Buildroot
+  package (which also cross-compiles the CFFI SPI extension on the Pi target).
 
-1. **Pump frames** from the launcher's Xvfb display to the GDEM0397T81P
-   e-paper panel — capture, resize, greyscale, dither, dispatch.
-2. **Pump inputs** from the seven GPIO buttons into Ren'Py as keypresses.
-
-The launcher renders. The runtime does not know what is on the screen; it
-only knows how to get pixels off Xvfb and onto e-ink, and how to feed buttons
-back the other way.
-
-**`buildroot_os` consumes this repo as a Buildroot package** (ADR 0008): it builds
-the wheel and runs the three console-scripts it exposes —
-
-- `inky-frame` — the Xvfb capture → dither → dispatch pipeline (`frame_processor`),
-- `inky-input` — the GPIO / TCP button reader → keypress injector (`input`),
-- `inky-eink-receiver` — the in-engine path: decode PNGs pushed by Ren'Py's
-  `eink_push_callback` over the engine-capture socket and feed them through the
-  *same* dither/dispatch pipeline (no second dither).
-
-The frame/input/SPI/ESP32 contracts those tools share are owned here and generated
-from `meta/shared/hardware.toml` (see "GPIO pin map"), so the package stays cleanly
-self-describing for downstream consumers.
+The runtime does not know what is on the screen; it knows how to turn RGB/PNG
+pixels into packed 1-bit panel frames, how to talk to the GDEM0397T81P, and
+what the seven buttons are called.
 
 ## Architecture
 
 ```
-+---------------------+      +---------------------+
-|  launcher (Ren'Py)  | <--- |  input/             | <--- 7x GPIO buttons
-|  draws into Xvfb    |      |  gpiozero -> xdotool|
-+----------+----------+      +---------------------+
-           |
-           v Xvfb root window
-+----------+----------+      +---------------------+      +-------------+
-|  frame_processor/   | ---> |  spi_driver/ (C)    | ---> | e-paper HW  |
-|  capture -> resize  |      |  init/refresh/sleep |      | GDEM0397T81P|
-|  -> grey -> dither  |      +---------------------+      +-------------+
-+----------+----------+
-           |  EINKY_BACKEND=socket (dev)
-           v
-+---------------------+
-|  Unix socket        |  ---> tools/preview.py on a workstation
-|  /tmp/einky-…sock   |
-+---------------------+
+producers                       process (one impl)                 dispatch
+launcher Canvas / game PNGs --> frame_processor/                -> spi_driver/ (C, libgpiod +
+(or Xvfb capture, legacy)       grey -> Floyd-Steinberg            /dev/spidev0.0) -> GDEM0397T81P
+                                dither -> pack 1-bit (MSB)      -> SocketSink/TcpFrameSink (dev preview)
+
+input                           input/
+7x GPIO (gpiozero) / TCP    --> keymap.py (generated from the contract)
+                                net_sender.py -> a game's input socket
 ```
 
-Two systemd units in `systemd/` glue this onto boot. Both depend on
-`inky-launcher.service` from the launcher repo.
+Console scripts (installed by the wheel; useful for debugging — since ADR 0009
+the launcher performs these roles in-process and none are in the boot path):
+
+- `inky-frame` — standalone Xvfb capture → dither → dispatch loop,
+- `inky-input` — standalone GPIO/TCP button reader → keysym injector,
+- `inky-eink-receiver` — standalone engine-capture (PNG socket) receiver.
+
+The frame/input/SPI contracts are owned here and generated from
+`meta/shared/hardware.toml` (see "GPIO pin map"), so the package stays cleanly
+self-describing for downstream consumers. (The `systemd/` units and the ESP32
+firmware under `firmware/esp32` are retired pre-Buildroot/pre-ADR-0009
+artifacts kept for reference.)
 
 ## Layout
 
@@ -61,8 +51,9 @@ Two systemd units in `systemd/` glue this onto boot. Both depend on
 | `tests/unit`          | Mocked GPIO / mocked framebuffer                 |
 | `tests/integration`   | Socket-backed end-to-end against golden frames   |
 | `tests/golden`        | Golden hashes pinning dither output              |
-| `scripts/`            | `install-renpy-sdk.sh` (symlinked from `meta/`)  |
-| `systemd/`            | Service units consumed by `os/stage-runtime/`    |
+| `scripts/`            | `gen_from_contract.py` (`make gen`) + `install-renpy-sdk.sh` (symlinked from `meta/`) |
+| `systemd/`            | Retired pre-Buildroot service units (kept for reference) |
+| `firmware/esp32`      | Retired ESP32 dev bridge (ADR 0006; kept for reference) |
 
 ## GPIO pin map
 
@@ -128,19 +119,23 @@ Override paths via env:
 | `EINKY_LOG_LEVEL`    | `INFO`                        |
 | `DISPLAY`            | `:0`                          |
 
-## Cooperation with the launcher
+## Cooperation with the launcher (ADR 0009)
 
-The launcher is a Ren'Py game running under Xvfb on `:0`. It draws normally;
-it does not know e-paper exists. The runtime:
+The launcher — a native Python app, not a Ren'Py game — owns the panel and the
+buttons for the whole uptime and imports this repo directly:
 
-- captures the Xvfb root every `1 / EINKY_TARGET_FPS` seconds (default 2 fps),
-- pushes a partial refresh to the panel each frame,
-- triggers a full refresh every 30 frames to clear ghosting,
-- deep-sleeps the panel on shutdown.
-
-For inputs: `xdotool` posts keysyms to the focused window on `:0`, which is
-always the Ren'Py game (the launcher locks focus). Ren'Py's standard
-`config.keymap` consumes them like any keyboard event.
+- **menu frames:** the launcher packs its own Pillow canvas and calls the panel
+  driver (`open_panel().partial_refresh/full_refresh`), deciding partial vs
+  full itself;
+- **game frames:** a running Ren'Py game pushes PNGs over the engine-capture
+  socket; the launcher decodes them through this repo's
+  `to_panel_grey -> floyd_steinberg -> pack_1bit` (one dither implementation,
+  ADR 0008) and drives the panel;
+- **input:** the launcher reads GPIO via the generated keymap and forwards
+  button *names* to the game's input socket via `input.net_sender`; the
+  in-game hook queues the mapped Ren'Py events. No X-level key injection is in
+  the shipping path;
+- the panel is deep-slept before power-off.
 
 ## Setup
 
@@ -153,8 +148,8 @@ make run-dev       # EINKY_BACKEND=socket, talks to tools/preview.py
 make run-prod      # EINKY_BACKEND=spi, on the Pi
 ```
 
-The Ren'Py SDK is **not** installed here. On the Pi it lives at
-`/opt/renpy-sdk` (placed by `os/stage-runtime/`). On a dev workstation:
+The Ren'Py SDK is **not** installed here. On the device the engine is built
+from source by `buildroot_os` and lives at `/opt/renpy`. On a dev workstation:
 
 ```bash
 ./scripts/install-renpy-sdk.sh ~/renpy

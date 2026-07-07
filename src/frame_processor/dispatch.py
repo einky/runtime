@@ -17,6 +17,8 @@ from __future__ import annotations
 import logging
 import socket
 import struct
+import threading
+from contextlib import suppress
 from typing import Protocol
 
 from frame_processor.constants import MAGIC
@@ -78,11 +80,14 @@ class SpiSink:
 
 
 class TcpFrameSink:
-    """Dev-mode sink that streams frames to a TCP client (the ESP32 bridge).
+    """Dev-mode sink that streams frames to a TCP client (host preview / bridge).
 
-    We bind+listen on `host:port`, accept one client at a time, and re-accept
-    on disconnect. Frames sent while no client is connected are dropped; the
-    ESP32 will pick up at the next produced frame.
+    We bind+listen on `host:port`, accept one client at a time (in a background
+    thread), and re-accept on disconnect. A newly connected client is immediately
+    sent the *last* produced frame, so a preview that attaches after boot shows
+    the current screen right away instead of a blank window until the next redraw
+    (the launcher is event-driven and may sit idle for a long time). Frames
+    produced while no client is connected are still dropped.
     """
 
     _ACCEPT_POLL_SECONDS = 0.5
@@ -94,41 +99,61 @@ class TcpFrameSink:
         self._server.bind(self._addr)
         self._server.listen(1)
         self._server.settimeout(self._ACCEPT_POLL_SECONDS)
+        self._lock = threading.Lock()
         self._client: socket.socket | None = None
+        self._last: bytes | None = None  # last full frame (header + packed)
+        self._stop = threading.Event()
+        self._acceptor = threading.Thread(
+            target=self._accept_loop, name="frame-accept", daemon=True
+        )
+        self._acceptor.start()
         log.info("TCP frame sink listening on %s:%d", host, port)
 
-    def _ensure_client(self) -> socket.socket | None:
-        if self._client is not None:
-            return self._client
-        try:
-            conn, peer = self._server.accept()
-        except TimeoutError:
-            return None
-        conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-        log.info("frame client connected from %s:%d", peer[0], peer[1])
-        self._client = conn
-        return conn
+    def _accept_loop(self) -> None:
+        while not self._stop.is_set():
+            try:
+                conn, peer = self._server.accept()
+            except TimeoutError:
+                continue
+            except OSError:
+                break
+            conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            log.info("frame client connected from %s:%d", peer[0], peer[1])
+            with self._lock:
+                if self._client is not None:  # one client at a time; drop the old one
+                    with suppress(OSError):
+                        self._client.close()
+                self._client = conn
+                last = self._last
+            if last is not None:  # replay current screen to the fresh client
+                self._send_to(conn, last)
 
-    def send(self, packed: bytes, width: int, height: int) -> None:
-        client = self._ensure_client()
-        if client is None:
-            return
-        header = MAGIC + struct.pack("<II", width, height)
+    def _send_to(self, client: socket.socket, framed: bytes) -> None:
         try:
-            client.sendall(header + packed)
+            client.sendall(framed)
         except (BrokenPipeError, ConnectionResetError, TimeoutError, OSError) as e:
             log.warning("frame client dropped (%s); will re-accept", e)
-            try:
+            with self._lock:
+                if self._client is client:
+                    self._client = None
+            with suppress(OSError):
                 client.close()
-            finally:
-                self._client = None
+
+    def send(self, packed: bytes, width: int, height: int) -> None:
+        framed = MAGIC + struct.pack("<II", width, height) + packed
+        with self._lock:
+            self._last = framed
+            client = self._client
+        if client is not None:
+            self._send_to(client, framed)
 
     def close(self) -> None:
-        if self._client is not None:
-            try:
-                self._client.close()
-            finally:
-                self._client = None
+        self._stop.set()
+        with self._lock:
+            client, self._client = self._client, None
+        if client is not None:
+            with suppress(OSError):
+                client.close()
         self._server.close()
 
 
